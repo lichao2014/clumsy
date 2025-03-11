@@ -9,7 +9,9 @@
 
 #define BANDWIDTH_MIN  "0"
 #define BANDWIDTH_MAX  "99999"
-
+#define DELAY_MIN "0"
+#define DELAY_MAX "99999"
+#define DELAY_DEFAULT 0
 
 //---------------------------------------------------------------------
 // rate stats
@@ -40,21 +42,100 @@ void crate_stats_update(CRateStats *rate, int32_t count, uint32_t now_ts);
 // calculate rate
 int32_t crate_stats_calculate(CRateStats *rate, uint32_t now_ts);
 
+typedef struct
+{
+	PacketNode* head;
+	PacketNode* tail;
+	int size;
+} PacketQueue;
+
+typedef struct {
+	CRateStats* rateStats;
+	PacketNode headNode, tailNode;
+	PacketQueue buf;
+} CBandwidth;
+
+static void queue_init(PacketQueue* q)
+{
+	q->head->next = q->tail;
+	q->tail->prev = q->head;
+	q->size = 0;
+}
+
+static void queue_free(PacketQueue* q)
+{
+	PacketNode* pac = q->head->next;
+	while (pac != q->tail) {
+		freeNode(popNode(pac));
+		pac = q->head->next;
+	}
+
+	q->size = 0;
+}
+
+static void queue_detach(PacketQueue* q, PacketNode* target)
+{
+	if (q->size == 0)
+	{
+		return;
+	}
+
+	PacketNode* n1 = target->prev;
+	PacketNode* n2 = q->head->next;
+	PacketNode* n3 = q->tail->prev;
+
+	n1->next = n2;
+	n2->prev = n1;
+
+	n3->next = target;
+	target->prev = n3;
+
+	queue_init(q);
+}
+
+static void bandwidth_init(CBandwidth *bw)
+{
+	if (bw->rateStats) crate_stats_delete(bw->rateStats);
+	bw->rateStats = crate_stats_new(1000, 1000);
+
+	if (bw->buf.head) {
+		queue_free(&bw->buf);
+	} else {
+		bw->buf.head = &bw->headNode;
+		bw->buf.tail = &bw->tailNode;
+		queue_init(&bw->buf);
+	}
+}
+
+static void bandwidth_deinit(CBandwidth* bw, PacketNode* tail)
+{
+	if (bw->rateStats) {
+		crate_stats_delete(bw->rateStats);
+		bw->rateStats = NULL;
+	}
+
+	if (bw->buf.head) {
+		queue_detach(&bw->buf, tail);
+	}
+}
+
 
 //---------------------------------------------------------------------
 // configuration
 //---------------------------------------------------------------------
-static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput;
+static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *bufInput;
 
 static volatile short bandwidthEnabled = 0,
-    bandwidthInbound = 1, bandwidthOutbound = 1;
+    bandwidthInbound = 1, bandwidthOutbound = 1,
+	bandwidthBufPackets = DELAY_DEFAULT;
 
 static volatile LONG bandwidthLimit = 0; 
-static CRateStats *rateStats = NULL;
-
+static CBandwidth inbound, outbound;
 
 static Ihandle* bandwidthSetupUI() {
     Ihandle *bandwidthControlsBox = IupHbox(
+		IupLabel("Buffer(pkts):"),
+		bufInput = IupText(NULL),
         inboundCheckbox = IupToggle("Inbound", NULL),
         outboundCheckbox = IupToggle("Outbound", NULL),
         IupLabel("Limit(KB/s):"),
@@ -73,11 +154,20 @@ static Ihandle* bandwidthSetupUI() {
     IupSetCallback(outboundCheckbox, "ACTION", (Icallback)uiSyncToggle);
     IupSetAttribute(outboundCheckbox, SYNCED_VALUE, (char*)&bandwidthOutbound);
 
+	// sync delay time
+	IupSetAttribute(bufInput, "VISIBLECOLUMNS", "3");
+	IupSetAttribute(bufInput, "VALUE", STR(DELAY_DEFAULT));
+	IupSetCallback(bufInput, "VALUECHANGED_CB", (Icallback)uiSyncInteger);
+	IupSetAttribute(bufInput, SYNCED_VALUE, (char*)&bandwidthBufPackets);
+	IupSetAttribute(bufInput, INTEGER_MAX, DELAY_MAX);
+	IupSetAttribute(bufInput, INTEGER_MIN, DELAY_MIN);
+
     // enable by default to avoid confusing
     IupSetAttribute(inboundCheckbox, "VALUE", "ON");
     IupSetAttribute(outboundCheckbox, "VALUE", "ON");
 
     if (parameterized) {
+		setFromParameter(bufInput, "VALUE", NAME"-buf");
         setFromParameter(inboundCheckbox, "VALUE", NAME"-inbound");
         setFromParameter(outboundCheckbox, "VALUE", NAME"-outbound");
         setFromParameter(bandwidthInput, "VALUE", NAME"-bandwidth");
@@ -87,16 +177,18 @@ static Ihandle* bandwidthSetupUI() {
 }
 
 static void bandwidthStartUp() {
-	if (rateStats) crate_stats_delete(rateStats);
-	rateStats = crate_stats_new(1000, 1000);
+	bandwidth_init(&inbound);
+	bandwidth_init(&outbound);
+
     LOG("bandwidth enabled");
 }
 
 static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
     UNREFERENCED_PARAMETER(head);
-    UNREFERENCED_PARAMETER(tail);
-	if (rateStats) crate_stats_delete(rateStats);
-	rateStats = NULL;
+
+	bandwidth_deinit(&inbound, tail);
+	bandwidth_deinit(&outbound, tail);
+
     LOG("bandwidth disabled");
 }
 
@@ -109,32 +201,51 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
 	DWORD now_ts = timeGetTime();
 	int limit = bandwidthLimit * 1024;
 
-	if (limit <= 0 || rateStats == NULL) {
+	queue_detach(&inbound.buf, tail);
+	queue_detach(&outbound.buf, tail);
+
+	if (limit <= 0) {
 		return 0;
 	}
 
-    while (head->next != tail) {
-        PacketNode *pac = head->next;
-		int discard = 0;
-        // chance in range of [0, 10000]
-        if (checkDirection(pac->addr.Direction, bandwidthInbound, bandwidthOutbound)) {
-			int rate = crate_stats_calculate(rateStats, now_ts);
+	PacketNode* pac = tail->prev;
+    while (pac != head) {
+        PacketNode *prev = pac->prev;
+
+		CBandwidth* bw = NULL;
+		if (IS_INBOUND(pac->addr.Direction) && bandwidthInbound) {
+			bw = &inbound;
+		} else if (IS_OUTBOUND(pac->addr.Direction) && bandwidthOutbound) {
+			bw = &outbound;
+		}
+
+		if (bw) {
+			int rate = crate_stats_calculate(bw->rateStats, now_ts);
 			int size = pac->packetLen;
 			if (rate + size > limit) {
-				LOG("dropped with bandwidth %dKB/s, direction %s",
-					(int)bandwidthLimit, BOUND_TEXT(pac->addr.Direction));
-				discard = 1;
-			}
-			else {
-				crate_stats_update(rateStats, size, now_ts);
+				dropped++;
+
+				pac = popNode(pac);
+				if (bw->buf.size >= bandwidthBufPackets)
+				{
+					LOG("dropped with bandwidth %dKB/s, direction %s",
+						(int)bandwidthLimit, BOUND_TEXT(pac->addr.Direction));
+					freeNode(pac);
+				}
+				else
+				{
+					LOG("enqueue with dropped %d bufs %d bandwidth %dKB/s, direction %s",
+						dropped, bw->buf.size, (int)bandwidthLimit, BOUND_TEXT(pac->addr.Direction));
+
+					insertAfter(pac, bw->buf.head);
+					bw->buf.size++;
+				}
+			} else {
+				crate_stats_update(bw->rateStats, size, now_ts);
 			}
 		}
-		if (discard) {
-            freeNode(popNode(pac));
-            ++dropped;
-        } else {
-            head = head->next;
-        }
+
+		pac = prev;
     }
 
     return dropped > 0;

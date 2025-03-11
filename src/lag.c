@@ -88,13 +88,12 @@ static short lagProcess(PacketNode *head, PacketNode *tail) {
     PacketNode *pac = tail->prev;
     // pick up all packets and fill in the current time
     while (bufSize < KEEP_AT_MOST && pac != head) {
+        PacketNode* prev = pac->prev;
         if (checkDirection(pac->addr.Direction, lagInbound, lagOutbound)) {
             insertAfter(popNode(pac), bufHead)->timestamp = timeGetTime();
             ++bufSize;
-            pac = tail->prev;
-        } else {
-            pac = pac->prev;
         }
+        pac = prev;
     }
 
     // try sending overdue packets from buffer tail
