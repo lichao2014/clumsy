@@ -9,9 +9,9 @@
 
 #define BANDWIDTH_MIN  "0"
 #define BANDWIDTH_MAX  "99999"
-#define DELAY_MIN "0"
-#define DELAY_MAX "99999"
-#define DELAY_DEFAULT 0
+#define BUFFER_MIN "0"
+#define BUFFER_MAX "99999"
+#define BUFFER_DEFAULT 0
 
 //---------------------------------------------------------------------
 // rate stats
@@ -127,7 +127,7 @@ static Ihandle *inboundCheckbox, *outboundCheckbox, *bandwidthInput, *bufInput;
 
 static volatile short bandwidthEnabled = 0,
     bandwidthInbound = 1, bandwidthOutbound = 1,
-	bandwidthBufPackets = DELAY_DEFAULT;
+	bandwidthBuffer = BUFFER_DEFAULT;
 
 static volatile LONG bandwidthLimit = 0; 
 static CBandwidth inbound, outbound;
@@ -156,18 +156,18 @@ static Ihandle* bandwidthSetupUI() {
 
 	// sync delay time
 	IupSetAttribute(bufInput, "VISIBLECOLUMNS", "3");
-	IupSetAttribute(bufInput, "VALUE", STR(DELAY_DEFAULT));
+	IupSetAttribute(bufInput, "VALUE", STR(BUFFER_DEFAULT));
 	IupSetCallback(bufInput, "VALUECHANGED_CB", (Icallback)uiSyncInteger);
-	IupSetAttribute(bufInput, SYNCED_VALUE, (char*)&bandwidthBufPackets);
-	IupSetAttribute(bufInput, INTEGER_MAX, DELAY_MAX);
-	IupSetAttribute(bufInput, INTEGER_MIN, DELAY_MIN);
+	IupSetAttribute(bufInput, SYNCED_VALUE, (char*)&bandwidthBuffer);
+	IupSetAttribute(bufInput, INTEGER_MAX, BUFFER_MAX);
+	IupSetAttribute(bufInput, INTEGER_MIN, BUFFER_MIN);
 
     // enable by default to avoid confusing
     IupSetAttribute(inboundCheckbox, "VALUE", "ON");
     IupSetAttribute(outboundCheckbox, "VALUE", "ON");
 
     if (parameterized) {
-		setFromParameter(bufInput, "VALUE", NAME"-buf");
+		setFromParameter(bufInput, "VALUE", NAME"-buffer");
         setFromParameter(inboundCheckbox, "VALUE", NAME"-inbound");
         setFromParameter(outboundCheckbox, "VALUE", NAME"-outbound");
         setFromParameter(bandwidthInput, "VALUE", NAME"-bandwidth");
@@ -180,6 +180,8 @@ static void bandwidthStartUp() {
 	bandwidth_init(&inbound);
 	bandwidth_init(&outbound);
 
+	startTimePeriod();
+
     LOG("bandwidth enabled");
 }
 
@@ -188,6 +190,8 @@ static void bandwidthCloseDown(PacketNode *head, PacketNode *tail) {
 
 	bandwidth_deinit(&inbound, tail);
 	bandwidth_deinit(&outbound, tail);
+
+	endTimePeriod();
 
     LOG("bandwidth disabled");
 }
@@ -226,7 +230,7 @@ static short bandwidthProcess(PacketNode *head, PacketNode* tail) {
 				dropped++;
 
 				pac = popNode(pac);
-				if (bw->buf.size >= bandwidthBufPackets)
+				if (bw->buf.size >= bandwidthBuffer)
 				{
 					LOG("dropped with bandwidth %dKB/s, direction %s",
 						(int)bandwidthLimit, BOUND_TEXT(pac->addr.Direction));

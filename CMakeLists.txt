@@ -2,7 +2,7 @@ project(clumsy C)
 
 file(GLOB SRC src/*.c)
 file(GLOB INC src/*.h)
-add_executable(clumsy ${SRC} ${INC})
+add_executable(clumsy WIN32 ${SRC} ${INC})
 
 if (MSVC)
     set(IUP_COMPILE_PART dll11)
@@ -50,6 +50,7 @@ target_link_libraries(
 PRIVATE
     iup
     WinDivert
+    comctl32
     winmm
     ws2_32
 )
